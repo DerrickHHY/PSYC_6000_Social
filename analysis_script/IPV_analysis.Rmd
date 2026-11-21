@@ -1,0 +1,292 @@
+---
+title: "IPV analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+# Data reading
+
+```{r}
+source("func/ord_class_index.R")
+source("func/index.R")
+
+library(ordinalForest)
+library(pdfCluster)
+library(psych)
+
+dati <- read.csv("ESS7e02_3.csv")
+```
+
+# Missing values
+
+```{r}
+vars_7799 <- c("sclmeet", "inprdsc", "eduyrs", "hhmmb")
+for (v in intersect(vars_7799, names(dati))) dati[[v]][dati[[v]] %in% c(77, 88, 99)] <- NA
+
+vars_789 <- c("fltlnl", "sclact", "hincfel", "health")
+for (v in intersect(vars_789, names(dati))) dati[[v]][dati[[v]] %in% c(7, 8, 9)] <- NA
+
+if ("gndr" %in% names(dati)) dati$gndr[dati$gndr %in% 9] <- NA
+if ("agea" %in% names(dati)) dati$agea[dati$agea %in% 999] <- NA
+```
+
+# Data preparation
+
+```{r}
+factor_vars <- c("gndr", "cntry")
+factor_vars <- intersect(factor_vars, names(dati))
+dati[factor_vars] <- lapply(dati[factor_vars], as.factor)
+
+dati$y     <- factor(dati$fltlnl, ordered = TRUE)   # 4 classes, not merged
+dati$group <- factor(dati$cntry)
+
+xnam <- c("sclmeet", "inprdsc", "sclact", "agea", "gndr",
+          "eduyrs", "hincfel", "hhmmb", "health")
+
+vars_keep <- c("y", "group", xnam)
+dati_sel  <- dati[, vars_keep]
+n_before  <- nrow(dati_sel)
+dati_model <- na.omit(dati_sel)
+n_after   <- nrow(dati_model)
+cat(sprintf("Listwise deletion: %d -> %d rows (%.1f%% dropped)\n",
+            n_before, n_after, 100 * (n_before - n_after) / n_before))
+
+# Randomly sample 500 per country (to reduce computation, independent of y)
+set.seed(1999)
+sub_n <- 500
+dati_model <- do.call(rbind, lapply(split(dati_model, dati_model$group), function(d) {
+  d[sample.int(nrow(d), size = min(nrow(d), sub_n)), ]
+}))
+dati_model <- droplevels(dati_model)
+
+cat(sprintf("Subsample: %d rows, %d countries\n",
+            nrow(dati_model), length(levels(dati_model$group))))
+table(dati_model$y)
+```
+
+# Support functions
+
+```{r}
+fit_with_warnings <- function(expr) {
+  warns <- character(0)
+  fit <- withCallingHandlers(
+    tryCatch(expr, error = function(e) {
+      structure(list(error = conditionMessage(e)), class = "fit_error")
+    }),
+    warning = function(w) {
+      warns <<- c(warns, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = warns)
+}
+
+predict_of_unified <- function(model, newdata, xnam, lev) {
+  nd <- newdata[, xnam, drop = FALSE]
+  p  <- predict(model, newdata = nd)
+  prob <- as.data.frame(p$classprobs)
+  if (!all(as.character(lev) %in% names(prob))) {
+    if (ncol(prob) == length(lev)) names(prob) <- as.character(lev)
+  }
+  prob <- prob[, as.character(lev), drop = FALSE]
+  names(prob) <- lev
+  resp <- factor(as.character(p$ypred), levels = lev, ordered = TRUE)
+  list(mu = prob, response = resp)
+}
+
+confusion_full <- function(y_true, y_pred, lev) {
+  tab <- table(factor(y_true, levels = lev, ordered = TRUE),
+               factor(y_pred, levels = lev, ordered = TRUE))
+  dimnames(tab) <- list(observed = lev, predicted = lev)
+  tab
+}
+
+ordinal_index_safe <- function(cm) {
+  if (!exists("OrdinalClassificationIndex")) return(NA_real_)
+  tryCatch(OrdinalClassificationIndex(cm, nrow(cm)), error = function(e) NA_real_)
+}
+
+newindex_safe <- function(mu, y_num, K) {
+  if (!exists("newindex")) return(NA_real_)
+  if (is.null(mu)) return(NA_real_)
+  tryCatch(newindex(mu, y_num, K)$norm.index, error = function(e) NA_real_)
+}
+
+weighted_kappa_safe <- function(y_true, y_pred, lev, weights = "quadratic") {
+  y_true <- factor(y_true, levels = lev, ordered = TRUE)
+  y_pred <- factor(y_pred, levels = lev, ordered = TRUE)
+  tab <- table(y_true, y_pred)
+  n <- sum(tab)
+  K <- length(lev)
+  if (n == 0 || K < 2) return(NA_real_)
+  d <- abs(row(tab) - col(tab))
+  if (weights == "linear") W <- d / (K - 1)
+  else if (weights == "quadratic") W <- (d / (K - 1))^2
+  else stop("weights must be 'linear' or 'quadratic'")
+  O <- tab / n
+  E <- outer(rowSums(tab), colSums(tab)) / n^2
+  den <- sum(W * E)
+  if (den == 0) return(NA_real_)
+  1 - sum(W * O) / den
+}
+
+macro_precision <- function(y_true, y_pred, lev) {
+  prec <- sapply(lev, function(c) {
+    tp <- sum(y_true == c & y_pred == c)
+    fp <- sum(y_true != c & y_pred == c)
+    if ((tp + fp) == 0) NA else tp / (tp + fp)
+  })
+  mean(prec, na.rm = TRUE)
+}
+
+macro_recall <- function(y_true, y_pred, lev) {
+  rec <- sapply(lev, function(c) {
+    tp <- sum(y_true == c & y_pred == c)
+    fn <- sum(y_true == c & y_pred != c)
+    if ((tp + fn) == 0) NA else tp / (tp + fn)
+  })
+  mean(rec, na.rm = TRUE)
+}
+
+model_metrics <- function(name, pred, y_true, lev) {
+  y_num <- as.numeric(y_true)
+  pred_num <- as.numeric(pred$response)
+  cm <- confusion_full(y_true, pred$response, lev)
+  data.frame(
+    model = name,
+    accuracy = mean(y_num == pred_num),
+    recall = macro_recall(y_num, pred_num, seq_along(lev)),
+    precision = macro_precision(y_num, pred_num, seq_along(lev)),
+    rmse = sqrt(mean((y_num - pred_num)^2)),
+    mae = mean(abs(y_num - pred_num)),
+    ordinal_classification_index = ordinal_index_safe(cm),
+    adjusted_rand_index = adj.rand.index(y_num, pred_num),
+    cohen_kappa = cohen.kappa(cbind(y_num, pred_num))$kappa,
+    cohen_weighted_kappa = weighted_kappa_safe(y_true, y_pred = pred$response,
+                                               lev = lev, weights = "quadratic"),
+    new_index = newindex_safe(pred$mu, y_num, length(lev))
+  )
+}
+```
+
+# Incremental predictive value (5-fold CV)
+
+```{r}
+n_folds <- 5
+
+# 4 nested models: base excludes inprdsc / sclact
+base_vars <- setdiff(xnam, c("inprdsc", "sclact"))
+model_specs <- list(
+  base         = base_vars,
+  base_inprdsc = c(base_vars, "inprdsc"),
+  base_sclact  = c(base_vars, "sclact"),
+  all          = xnam
+)
+
+# Fold assignment: within each country, stratify by y and split into 5 parts (consistent with the main analysis)
+set.seed(1999)
+fold_id <- integer(nrow(dati_model))
+for (g in levels(dati_model$group)) {
+  idx <- which(dati_model$group == g)
+  yg  <- droplevels(dati_model$y[idx])
+  fold_g <- integer(length(idx))
+  for (cl in levels(yg)) {
+    j <- which(yg == cl)
+    fold_g[j] <- sample(rep(seq_len(n_folds), length.out = length(j)))
+  }
+  fold_id[idx] <- fold_g
+}
+cat("Sample size per fold:\n"); print(table(fold_id))
+
+results_list <- vector("list", n_folds)
+
+for (fold in seq_len(n_folds)) {
+  cat("\n===== Fold", fold, "/", n_folds, "=====\n")
+
+  test_idx  <- which(fold_id == fold)
+  train_idx <- which(fold_id != fold)
+  data_train <- droplevels(dati_model[train_idx, ])
+  data_test  <- dati_model[test_idx, ]
+
+  # Align factor levels (gndr)
+  for (v in names(data_train)) {
+    if (is.factor(data_train[[v]])) {
+      data_test[[v]] <- factor(data_test[[v]], levels = levels(data_train[[v]]),
+                               ordered = is.ordered(data_train[[v]]))
+    }
+  }
+  data_test <- data_test[!is.na(data_test$y) & !is.na(data_test$gndr), ]
+
+  y           <- data_train$y
+  lev         <- levels(y)
+  y_test_orig <- data_test$y
+
+  rows_list <- list()
+  for (nm in names(model_specs)) {
+    xs <- model_specs[[nm]]
+    of_res <- fit_with_warnings(
+      ordfor(depvar = "y", perffunction = "probability",
+             data = data_train[, c("y", xs)])
+    )
+    of_fit <- of_res$fit
+    if (!inherits(of_fit, "fit_error")) {
+      po_test <- tryCatch(predict_of_unified(of_fit, data_test, xs, lev),
+                          error = function(e) NULL)
+      if (!is.null(po_test)) {
+        m <- model_metrics(nm, po_test, y_test_orig, lev)
+        m$fold <- fold
+        rows_list[[length(rows_list) + 1]] <- m
+      }
+    }
+  }
+  results_list[[fold]] <- do.call(rbind, rows_list)
+
+  cat("  test acc:",
+      paste(sprintf("%s=%.3f", results_list[[fold]]$model,
+                    results_list[[fold]]$accuracy), collapse = " | "), "\n")
+}
+```
+
+# IPV summary
+
+```{r}
+results_all <- do.call(rbind, results_list)
+
+# 5-fold mean +/- SD per model (3 core metrics)
+summ <- do.call(rbind, lapply(unique(results_all$model), function(md) {
+  g <- results_all[results_all$model == md, ]
+  data.frame(
+    model    = md,
+    acc_mean = mean(g$accuracy),  acc_sd  = sd(g$accuracy),
+    kap_mean = mean(g$cohen_weighted_kappa), kap_sd = sd(g$cohen_weighted_kappa),
+    mae_mean = mean(g$mae),        mae_sd  = sd(g$mae)
+  )
+}))
+summ <- summ[match(c("base", "base_inprdsc", "base_sclact", "all"), summ$model), ]
+print(summ, row.names = FALSE)
+
+# Incremental predictive value (relative to base; higher accuracy/kappa is better, lower MAE is better -> take the "improvement" uniformly)
+base <- summ[summ$model == "base", ]
+ipv <- data.frame(
+  added = c("inprdsc", "sclact", "inprdsc + sclact (all)"),
+  delta_accuracy = c(
+    summ$acc_mean[summ$model == "base_inprdsc"] - base$acc_mean,
+    summ$acc_mean[summ$model == "base_sclact"]  - base$acc_mean,
+    summ$acc_mean[summ$model == "all"]          - base$acc_mean
+  ),
+  delta_kappa = c(
+    summ$kap_mean[summ$model == "base_inprdsc"] - base$kap_mean,
+    summ$kap_mean[summ$model == "base_sclact"]  - base$kap_mean,
+    summ$kap_mean[summ$model == "all"]          - base$kap_mean
+  ),
+  delta_mae = c(
+    base$mae_mean - summ$mae_mean[summ$model == "base_inprdsc"],
+    base$mae_mean - summ$mae_mean[summ$model == "base_sclact"],
+    base$mae_mean - summ$mae_mean[summ$model == "all"]
+  )
+)
+print(ipv, row.names = FALSE)
+
+saveRDS(results_all, "ipv_results.rds")
+
+```
